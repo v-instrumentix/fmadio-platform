@@ -10,6 +10,7 @@
 #define  __FMADIO_PACKET_H__
 
 //---------------------------------------------------------------------------------------------
+
 #ifndef __F_TYPES_H__
 
 #ifndef __cplusplus
@@ -91,6 +92,7 @@ static void ndelay(u64 ns)
 #define FMADRING_ENTRYCNT		(1*1024)			// number of entries in the ring 
 
 #define FMADRING_FLAG_EOF		(1<<0)				// end of file exit
+#define FMADRING_FLAG_FCSERR	(1<<1)				// packet has an FCS error
 
 typedef struct fFMADRingPacket_t
 {
@@ -126,17 +128,23 @@ typedef struct fFMADRingHeader_t
 	u32				IsTxFlowControl;				// tx has flow control enabled 
 	u64				TxTimeout;						// tx maximum timeout to wait
 
-	u8				align0[4096-4*4-3*8-128];			// keep header/put/get all on seperate 4K pages
+	u64				PendingB;						// number of bytes pending (on the Put side)
+
+	u8				align0[4096-4*4-4*8-128];		// keep header/put/get all on seperate 4K pages
 
 	//--------------------------------------------------------------------------------	
 	
 	volatile s64	Put;							// write pointer (not maseked)
-	u8				align1[4096-1*8];				// keep header/put/get all on seperate 4K pages
+	volatile u64	PutByte;						// total number of bytes
+	volatile u64	PutPktTS;						// pcap timestamp of last put packet
+	u8				align1[4096-3*8];				// keep header/put/get all on seperate 4K pages
 
 	//--------------------------------------------------------------------------------	
 
 	volatile s64	Get;							// read pointer	(not maseked)
-	u8				align2[4096-1*8];				// keep header/put/get all on seperate 4K pages
+	volatile u64	GetByte;						// read total bytes
+	volatile u64	GetPktTS;						// pcap tiemstamp of last read packet
+	u8				align2[4096-3*8];				// keep header/put/get all on seperate 4K pages
 
 	fFMADRingPacket_t	Packet[FMADRING_ENTRYCNT];	// actual ring size does not need to be that deep
 
@@ -154,46 +162,50 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 	//check ring file size is correct
 	struct stat s;
 	memset(&s, 0, sizeof(s));
-	stat((char*)Path, &s);
+	stat(Path, &s);
 
 	//including if no file created 
 	if (s.st_size != sizeof(fFMADRingHeader_t))
 	{
-		fprintf(stderr, "RING Size missmatch %li %li %s\n", s.st_size, sizeof(fFMADRingHeader_t), Path); 
+		fprintf(stderr, "RING[%-50s] Size missmatch %lli %lli\n", Path, (u64)s.st_size, (u64)sizeof(fFMADRingHeader_t) );
 
-		int fd = open64((char*)Path,  O_RDWR | O_CREAT, 0666);
-		fprintf(stderr, "errno:%i %i\n", fd, errno);
+		int fd = open64(Path,  O_RDWR | O_CREAT, 0666);	
+		if (fd < 0)
+		{
+			fprintf(stderr, "RING[%-50s] failed to create new ring  errno:%i %s\n", Path, errno, strerror(errno));
+		}
 		assert(fd > 0);
-		ftruncate(fd, sizeof(fFMADRingHeader_t)); 
+
+		ftruncate(fd, sizeof(fFMADRingHeader_t));
 		close(fd);
 	}
 
 	// open
-	int fd  = open64((char*)Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);
+	int fd  = open64(Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);	
 	if (fd < 0)
 	{
-		fprintf(stderr, "failed to create FMADRing file [%s] errno:%i %s\n",  Path, errno, strerror(errno));
+		fprintf(stderr, "RING[%-50s] failed to create FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
 		return -1;
 	}
 
 	// map it
-	u8* Map = (u8*) mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (Map == (u8*)-1)
 	{
-		fprintf(stderr, "failed to map RING [%s]\n", Path);
+		fprintf(stderr, "RING[%-50s]failed to map RING\n", Path);
 		return -1;	
 	}
 
 	fFMADRingHeader_t* RING = (fFMADRingHeader_t*)Map;
 
 	// check version
-	fprintf(stderr, "Ring size   : %li %i\n", sizeof(fFMADRingHeader_t), FMADRING_MAPSIZE);
-	fprintf(stderr, "Ring Version: %8x %8x\n", RING->Version, FMADRING_VERSION); 
+	fprintf(stderr, "RING[%-50s] Size   : %li %i\n", Path, sizeof(fFMADRingHeader_t), FMADRING_MAPSIZE);
+	fprintf(stderr, "RING[%-50s] Version: %8x %8x\n", Path, RING->Version, FMADRING_VERSION);
 
 	// version wrong then force reset
 	if (RING->Version != FMADRING_VERSION)
 	{
-		fprintf(stderr, "RING version wrong force reset\n");
+		fprintf(stderr, "RING[%-50s] version wrong force reset\n", Path);
 		IsReset = true;
 	}
 
@@ -217,7 +229,7 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 		RING->Version		= FMADRING_VERSION;		
 
 		// copy path for debug 
-		strncpy((char*)RING->Path, (char*)Path, sizeof(RING->Path));
+		strncpy(RING->Path, Path, sizeof(RING->Path));
 	}
 
 	// check everything matches 
@@ -226,8 +238,8 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 	assert(RING->Depth 		== FMADRING_ENTRYCNT); 
 	assert(RING->Mask		== FMADRING_ENTRYCNT - 1); 
 
-	fprintf(stderr, "RING[%s]: Put:%llx %llx %p\n", RING->Path, RING->Put, RING->Put & RING->Mask, &RING->Put);
-	fprintf(stderr, "RING[%s]: Get:%llx %llx %p\n", RING->Path, RING->Get, RING->Get & RING->Mask, &RING->Get);
+	fprintf(stderr, "RING[%-50s] Put:%llx %llx %p\n", RING->Path, RING->Put, RING->Put & RING->Mask, &RING->Put);
+	fprintf(stderr, "RING[%-50s] Get:%llx %llx %p\n", RING->Path, RING->Get, RING->Get & RING->Mask, &RING->Get);
 
 	// settings
 	RING->IsTxFlowControl	= IsFlowControl;	
@@ -249,33 +261,31 @@ static inline int FMADPacket_OpenRx(	int* 				pfd,
 ){
 	int fd = 0;	
 
-	fd  = open64((char*)Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);
+	fd  = open64(Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);	
 	if (fd < 0)
 	{
-		fprintf(stderr, "failed to create FMADRing file [%s] errno:%i %s\n",  Path, errno, strerror(errno));
+		fprintf(stderr, "RING[%-50s] failed to create FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
 		return -1;
 	}
 
 	// map it
-	u8* Map = (u8*)mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (Map == (u8*)-1)
 	{
-		fprintf(stderr, "failed to map RING [%s]\n", Path);
+		fprintf(stderr, "RING[%-50s] failed to map RING\n", Path);
 		return -1;	
 	}
 
 	fFMADRingHeader_t* RING = (fFMADRingHeader_t*)Map;
 
 	// check version
-	fprintf(stderr, "Ring size   : %li %i %i\n", sizeof(fFMADRingHeader_t), RING->Size, FMADRING_MAPSIZE);
-	fprintf(stderr, "Ring Version: %8x %8x\n", RING->Version, FMADRING_VERSION); 
-	fprintf(stderr, "Ring Depth  : %8llx %8x\n", RING->Depth, FMADRING_ENTRYCNT); 
-	fprintf(stderr, "Ring Mask   : %8llx %8x\n", RING->Mask, FMADRING_ENTRYCNT-1); 
+	fprintf(stderr, "RING[%-50s] Size   : %li %i %i\n", Path, sizeof(fFMADRingHeader_t), RING->Size, FMADRING_MAPSIZE);
+	fprintf(stderr, "RING[%-50s] Version: %8x %8x\n", Path, RING->Version, FMADRING_VERSION);
 
 	// version wrong then force reset
 	if (RING->Version != FMADRING_VERSION)
 	{
-		fprintf(stderr, "RING version wrong\n");
+		fprintf(stderr, "RING[%-50s] version wrong\n", Path);
 		assert(false);
 	}
 
@@ -288,8 +298,9 @@ static inline int FMADPacket_OpenRx(	int* 				pfd,
 	//reset get point to current write pointer 
 	RING->Get = RING->Put;
 
-	fprintf(stderr, "RING: Put:%llx %llx\n", RING->Put, RING->Put & RING->Mask);
-	fprintf(stderr, "RING: Get:%llx %llx\n", RING->Get, RING->Get & RING->Mask);
+	fprintf(stderr, "RING[%-50s] Path:%s", Path, RING->Path);
+	fprintf(stderr, "RING[%-50s] Put:%llx %llx\n", Path, RING->Put, RING->Put & RING->Mask);
+	fprintf(stderr, "RING[%-50s] Get:%llx %llx\n", Path, RING->Get, RING->Get & RING->Mask);
 
 	// update files
 	if (pfd) 	pfd[0] 		= fd;
@@ -299,12 +310,61 @@ static inline int FMADPacket_OpenRx(	int* 				pfd,
 }
 
 //---------------------------------------------------------------------------------------------
+// open fmad packet ring for monitoring only (read only)
+static inline int FMADPacket_OpenMon(	int* 				pfd,
+										fFMADRingHeader_t** pRing,
+										u8* 				Path
+){
+	int fd = 0;
+
+	fd  = open64(Path,  O_RDONLY, S_IRWXU | S_IRWXG | 0777);
+	if (fd < 0)
+	{
+		fprintf(stderr, "RING[%-50s] ERROR failed to open FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
+		return -1;
+	}
+
+	// map it
+	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ, MAP_SHARED, fd, 0);
+	if (Map == (u8*)-1)
+	{
+		fprintf(stderr, "RING[%-50s] ERROR failed to map RING (read only)\n", Path);
+		return -1;
+	}
+
+	fFMADRingHeader_t* RING = (fFMADRingHeader_t*)Map;
+
+	// version wrong then force reset
+	if (RING->Version != FMADRING_VERSION)
+	{
+		fprintf(stderr, "RING[%-50s] ERROR version wrong\n", Path);
+		return -1;
+	}
+
+	// check everything matches
+	assert(RING->Size 		== sizeof(fFMADRingHeader_t));
+	assert(RING->SizePacket	== sizeof(fFMADRingPacket_t));
+	assert(RING->Depth 		== FMADRING_ENTRYCNT);
+	assert(RING->Mask		== FMADRING_ENTRYCNT - 1);
+
+	fprintf(stderr, "RING[%-50s] Status GOOD\n", Path);
+
+	// update files
+	if (pfd) 	pfd[0] 		= fd;
+	if (pRing) 	pRing[0] 	= RING;
+
+	return 0;
+}
+
+
+//---------------------------------------------------------------------------------------------
 // write packet 
 static inline int FMADPacket_SendV1(	fFMADRingHeader_t* 	RING, 
 										u64 				TS, 
 										u32 				LengthWire,
 										u32 				LengthCapture,
 										u32 				Port,
+										u32					Flag,
 										void*	 			Payload
 									)
 {
@@ -320,7 +380,7 @@ static inline int FMADPacket_SendV1(	fFMADRingHeader_t* 	RING,
 		u64 dTSC = (rdtsc() - TS0);
 		if (tsc2ns(dTSC) > RING->TxTimeout)
 		{
-			fprintf(stderr, "ERROR[%s]: RING wait for drain timeout %lli > %lli\n", RING->Path, tsc2ns(dTSC), RING->TxTimeout);
+			fprintf(stderr, "RING[%-50s] ERROR RING wait for drain timeout %lli > %lli\n", RING->Path, tsc2ns(dTSC), RING->TxTimeout);
 			return -1;
 		}
 	}
@@ -331,16 +391,19 @@ static inline int FMADPacket_SendV1(	fFMADRingHeader_t* 	RING,
 	FPkt->LengthWire		= LengthWire;
 	FPkt->LengthCapture		= LengthCapture;
 	FPkt->Port				= 0; 
-	FPkt->Flag				= 0; 
+	FPkt->Flag				= Flag;
 	memcpy(&FPkt->Payload[0], Payload, LengthCapture);
 
 	sfence();
 
 	// publish 
 	RING->Put 				+= 1;
+	RING->PutByte 			+= LengthCapture;
+	RING->PutPktTS 			= TS;
 
 	return LengthCapture;
 }
+
 
 //---------------------------------------------------------------------------------------------
 // send EOF marker 
@@ -358,7 +421,7 @@ static inline int FMADPacket_SendEOFV1(	fFMADRingHeader_t* 	RING, u64 TS)
 		u64 dTSC = (rdtsc() - TS0);
 		if (tsc2ns(dTSC) > RING->TxTimeout)
 		{
-			fprintf(stderr, "ERROR[%s]: RING wait for drain timeout EOF %lli %lli\n", RING->Path, tsc2ns(dTSC), RING->TxTimeout);
+			fprintf(stderr, "RING[%-50s] ERROR: RING wait for drain timeout EOF %lli %lli\n", RING->Path, tsc2ns(dTSC), RING->TxTimeout);
 			return -1;
 		}
 	}
@@ -375,20 +438,22 @@ static inline int FMADPacket_SendEOFV1(	fFMADRingHeader_t* 	RING, u64 TS)
 
 	// publish 
 	RING->Put 				+= 1;
-	return 0; 
-}
+	RING->PutPktTS			= TS;
 
+	return 0;
+}
 
 //---------------------------------------------------------------------------------------------
 // get a packet non-zero copy way but simple interface 
 static inline int FMADPacket_RecvV1(	fFMADRingHeader_t* RING, 
-										bool 		IsWait,
-										u64*		pTS,	
-										u32*		pLengthWire,	
-										u32*		pLengthCapture,	
-										u32*		pPort,	
-										void*		Payload	
-									) 
+											bool IsWait,
+											u64*		pTS,
+											u32*		pLengthWire,
+											u32*		pLengthCapture,
+											u32*		pPort,
+											u32*		pFlag,
+											void*		Payload
+										)
 {
 	fFMADRingPacket_t* Pkt = NULL;
 	do 
@@ -422,14 +487,50 @@ static inline int FMADPacket_RecvV1(	fFMADRingHeader_t* RING,
 	if (pLengthWire) 	pLengthWire[0] 		= Pkt->LengthWire;
 	if (pLengthCapture) pLengthCapture[0] 	= Pkt->LengthCapture;
 	if (pPort)			pPort[0]			= Pkt->Port;
+	if (pFlag)			pFlag[0]			= Pkt->Flag;
 	if (Payload)		memcpy(Payload, Pkt->Payload, Pkt->LengthCapture);
 
 	//sfence();
 
 	// next
-	RING->Get += 1;
+	RING->Get 		+= 1;
+	RING->GetByte 	+= Pkt->LengthCapture;
+	RING->GetPktTS	= Pkt->TS;
 
 	return Pkt->LengthCapture;
+}
+
+//---------------------------------------------------------------------------------------------
+// set/get the pending bytes
+static inline void FMADPacket_PendingByteSet(	fFMADRingHeader_t* RING, u64 PendingB)
+{
+	RING->PendingB = PendingB;
+}
+static inline u64 FMADPacket_PendingByteGet(	fFMADRingHeader_t* RING)
+{
+	return RING->PendingB;
+}
+
+//---------------------------------------------------------------------------------------------
+// get total byte counts
+static inline u64 FMADPacket_TotaBytePut( fFMADRingHeader_t* RING)
+{
+	return RING->PutByte;
+}
+static inline u64 FMADPacket_TotaByteGet( fFMADRingHeader_t* RING)
+{
+	return RING->GetByte;
+}
+
+//---------------------------------------------------------------------------------------------
+// get timestamp of last Put and Get packet
+static inline u64 FMADPacket_PktTSPut( fFMADRingHeader_t* RING)
+{
+	return RING->PutPktTS;
+}
+static inline u64 FMADPacket_PktTSGet( fFMADRingHeader_t* RING)
+{
+	return RING->GetPktTS;
 }
 
 //---------------------------------------------------------------------------------------------
