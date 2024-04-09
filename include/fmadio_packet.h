@@ -162,14 +162,14 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 	//check ring file size is correct
 	struct stat s;
 	memset(&s, 0, sizeof(s));
-	stat(Path, &s);
+	stat((char*)Path, &s);
 
 	//including if no file created 
 	if (s.st_size != sizeof(fFMADRingHeader_t))
 	{
 		fprintf(stderr, "RING[%-50s] Size missmatch %lli %lli\n", Path, (u64)s.st_size, (u64)sizeof(fFMADRingHeader_t) );
 
-		int fd = open64(Path,  O_RDWR | O_CREAT, 0666);	
+		int fd = open64((char*)Path,  O_RDWR | O_CREAT, 0666);
 		if (fd < 0)
 		{
 			fprintf(stderr, "RING[%-50s] failed to create new ring  errno:%i %s\n", Path, errno, strerror(errno));
@@ -181,7 +181,7 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 	}
 
 	// open
-	int fd  = open64(Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);	
+	int fd  = open64((char*)Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);
 	if (fd < 0)
 	{
 		fprintf(stderr, "RING[%-50s] failed to create FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
@@ -189,7 +189,7 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 	}
 
 	// map it
-	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	u8* Map = (u8*) mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (Map == (u8*)-1)
 	{
 		fprintf(stderr, "RING[%-50s]failed to map RING\n", Path);
@@ -229,7 +229,7 @@ static inline int FMADPacket_OpenTx(	int* 				pfd,
 		RING->Version		= FMADRING_VERSION;		
 
 		// copy path for debug 
-		strncpy(RING->Path, Path, sizeof(RING->Path));
+		strncpy((char*)RING->Path, (char*)Path, sizeof(RING->Path));
 	}
 
 	// check everything matches 
@@ -261,7 +261,7 @@ static inline int FMADPacket_OpenRx(	int* 				pfd,
 ){
 	int fd = 0;	
 
-	fd  = open64(Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);	
+	fd  = open64((char*)Path,  O_RDWR, S_IRWXU | S_IRWXG | 0777);
 	if (fd < 0)
 	{
 		fprintf(stderr, "RING[%-50s] failed to create FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
@@ -269,7 +269,7 @@ static inline int FMADPacket_OpenRx(	int* 				pfd,
 	}
 
 	// map it
-	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	u8* Map = (u8*)mmap64(0, FMADRING_MAPSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (Map == (u8*)-1)
 	{
 		fprintf(stderr, "RING[%-50s] failed to map RING\n", Path);
@@ -317,7 +317,7 @@ static inline int FMADPacket_OpenMon(	int* 				pfd,
 ){
 	int fd = 0;
 
-	fd  = open64(Path,  O_RDONLY, S_IRWXU | S_IRWXG | 0777);
+	fd  = open64((char*)Path,  O_RDONLY, S_IRWXU | S_IRWXG | 0777);
 	if (fd < 0)
 	{
 		fprintf(stderr, "RING[%-50s] ERROR failed to open FMADRing file errno:%i %s\n",  Path, errno, strerror(errno));
@@ -325,7 +325,7 @@ static inline int FMADPacket_OpenMon(	int* 				pfd,
 	}
 
 	// map it
-	u8* Map = mmap64(0, FMADRING_MAPSIZE, PROT_READ, MAP_SHARED, fd, 0);
+	u8* Map = (u8*)mmap64(0, FMADRING_MAPSIZE, PROT_READ, MAP_SHARED, fd, 0);
 	if (Map == (u8*)-1)
 	{
 		fprintf(stderr, "RING[%-50s] ERROR failed to map RING (read only)\n", Path);
